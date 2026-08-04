@@ -120,16 +120,17 @@ def test_unknown_phase_is_treated_as_corrupt(tmp_path, caplog) -> None:
     assert state == CONSERVATIVE
 
 
-def test_save_failure_is_reported_not_raised(tmp_path, caplog) -> None:
-    target_dir = tmp_path / "readonly"
-    target_dir.mkdir()
-    store = StateStore(target_dir / "state.json")
-    target_dir.chmod(0o500)
-    try:
-        with caplog.at_level(logging.ERROR):
-            saved = store.save(PersistedState())
-    finally:
-        target_dir.chmod(0o700)
+def test_save_failure_is_reported_not_raised(tmp_path, caplog, monkeypatch) -> None:
+    # Force the atomic rename to fail instead of relying on directory
+    # permissions, which root ignores.
+    store = StateStore(tmp_path / "state.json")
+
+    def deny_replace(src, dst) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("arr_recovery_watchdog.state.os.replace", deny_replace)
+    with caplog.at_level(logging.ERROR):
+        saved = store.save(PersistedState())
     assert saved is False
     assert "Failed to persist" in caplog.text
 
@@ -140,15 +141,13 @@ def test_verify_writable_succeeds_and_leaves_no_probe_file(tmp_path) -> None:
     assert list((tmp_path / "nested").iterdir()) == []
 
 
-def test_verify_writable_fails_on_readonly_directory(tmp_path, caplog) -> None:
-    target_dir = tmp_path / "readonly"
-    target_dir.mkdir()
-    store = StateStore(target_dir / "state.json")
-    target_dir.chmod(0o500)
-    try:
-        with caplog.at_level(logging.ERROR):
-            writable = store.verify_writable()
-    finally:
-        target_dir.chmod(0o700)
+def test_verify_writable_fails_on_unusable_state_directory(tmp_path, caplog) -> None:
+    # A regular file where the state directory should be fails mkdir/open for
+    # every user, root included — no permission tricks needed.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    store = StateStore(blocker / "state.json")
+    with caplog.at_level(logging.ERROR):
+        writable = store.verify_writable()
     assert writable is False
     assert "not writable" in caplog.text

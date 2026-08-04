@@ -421,7 +421,10 @@ tests/                         Fully mocked test suite (no live services)
 - Both HTTP clients are created with `trust_env=False`, so inherited proxy environment
   variables can never redirect health polls or API calls carrying Arr keys.
 - Health monitoring is synchronous with recovery: while a recovery sequence runs, ordinary
-  polling pauses, but Gluetun's health is re-checked before each application and during every
-  retry backoff, and an unhealthy result aborts the sequence. A failure-and-full-recovery of
-  Gluetun that fits entirely inside a single settle/backoff wait can still go unobserved;
-  the aborted applications remain pending and are retried, so no recovery is lost.
+  polling pauses, but Gluetun's health is re-checked before each application, during every
+  retry backoff, and once more after a sequence with failures. An unhealthy result aborts the
+  sequence and is recorded as a **fresh outage** — a new stabilization window is required and
+  the full sequence re-runs once health returns, exactly as if the outage had been seen by an
+  ordinary poll. A failure-and-full-recovery of Gluetun that fits entirely inside a single
+  settle/backoff wait can still go unobserved; the aborted applications remain pending and
+  are retried after the cooldown, so no recovery is lost.

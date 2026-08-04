@@ -101,11 +101,13 @@ def test_prowlarr_is_called_before_sonarr_and_radarr() -> None:
         return httpx.Response(200)
 
     runner, waits = make_runner(handler)
-    results = runner.run()
+    outcome = runner.run()
     assert requests[0] == PROWLARR_TESTALL
     assert set(requests[1:]) == {SONARR_TESTALL, RADARR_TESTALL}
     assert 10.0 in waits  # the settle period between Prowlarr and the others
-    assert results == {"Prowlarr": True, "Sonarr": True, "Radarr": True}
+    assert outcome.results == {"Prowlarr": True, "Sonarr": True, "Radarr": True}
+    assert outcome.gluetun_unhealthy is False
+    assert outcome.interrupted is False
 
 
 def test_one_failing_app_does_not_block_the_others() -> None:
@@ -118,8 +120,8 @@ def test_one_failing_app_does_not_block_the_others() -> None:
         return httpx.Response(200)
 
     runner, _ = make_runner(handler, retry_count=1)
-    results = runner.run()
-    assert results == {"Prowlarr": False, "Sonarr": True, "Radarr": True}
+    outcome = runner.run()
+    assert outcome.results == {"Prowlarr": False, "Sonarr": True, "Radarr": True}
     assert SONARR_TESTALL in requests
     assert RADARR_TESTALL in requests
 
@@ -195,8 +197,8 @@ def test_dry_run_sends_no_requests(caplog) -> None:
     import logging
 
     with caplog.at_level(logging.INFO):
-        results = runner.run()
-    assert results == {"Prowlarr": True, "Sonarr": True, "Radarr": True}
+        outcome = runner.run()
+    assert outcome.results == {"Prowlarr": True, "Sonarr": True, "Radarr": True}
     assert "DRY RUN" in caplog.text
 
 
@@ -226,9 +228,11 @@ def test_shutdown_during_settle_wait_skips_followers() -> None:
         return True
 
     runner, _ = make_runner(handler, waiter=interrupted_waiter)
-    results = runner.run()
+    outcome = runner.run()
     assert requests == [PROWLARR_TESTALL]
-    assert results == {"Prowlarr": True, "Sonarr": False, "Radarr": False}
+    assert outcome.results == {"Prowlarr": True, "Sonarr": False, "Radarr": False}
+    assert outcome.interrupted is True
+    assert outcome.gluetun_unhealthy is False
 
 
 def test_only_restricts_the_run_and_skips_the_settle_wait() -> None:
@@ -239,9 +243,9 @@ def test_only_restricts_the_run_and_skips_the_settle_wait() -> None:
         return httpx.Response(200)
 
     runner, waits = make_runner(handler)
-    results = runner.run(only={"Sonarr"})
+    outcome = runner.run(only={"Sonarr"})
     assert requests == [SONARR_TESTALL]  # Prowlarr already succeeded; not re-tested
-    assert results == {"Sonarr": True}
+    assert outcome.results == {"Sonarr": True}
     assert waits == []  # no settle wait when Prowlarr is not part of the run
 
 
@@ -253,9 +257,9 @@ def test_only_prowlarr_runs_without_followers_or_settle() -> None:
         return httpx.Response(200)
 
     runner, waits = make_runner(handler)
-    results = runner.run(only={"Prowlarr"})
+    outcome = runner.run(only={"Prowlarr"})
     assert requests == [PROWLARR_TESTALL]
-    assert results == {"Prowlarr": True}
+    assert outcome.results == {"Prowlarr": True}
     assert waits == []
 
 
@@ -264,8 +268,9 @@ def test_unhealthy_gluetun_before_start_aborts_the_whole_sequence() -> None:
         raise AssertionError(f"no request should be sent while Gluetun is unhealthy: {request.url}")
 
     runner, _ = make_runner(handler, health_gate=lambda: False)
-    results = runner.run()
-    assert results == {"Prowlarr": False, "Sonarr": False, "Radarr": False}
+    outcome = runner.run()
+    assert outcome.results == {"Prowlarr": False, "Sonarr": False, "Radarr": False}
+    assert outcome.gluetun_unhealthy is True
 
 
 def test_unhealthy_gluetun_after_settle_skips_followers() -> None:
@@ -277,9 +282,25 @@ def test_unhealthy_gluetun_after_settle_skips_followers() -> None:
         return httpx.Response(200)
 
     runner, _ = make_runner(handler, health_gate=lambda: next(gate_results))
-    results = runner.run()
+    outcome = runner.run()
     assert requests == [PROWLARR_TESTALL]
-    assert results == {"Prowlarr": True, "Sonarr": False, "Radarr": False}
+    assert outcome.results == {"Prowlarr": True, "Sonarr": False, "Radarr": False}
+    assert outcome.gluetun_unhealthy is True
+
+
+def test_gluetun_outage_first_seen_after_the_last_app_is_reported() -> None:
+    # Sonarr and Radarr fail at the API level because the VPN is dropping at
+    # that very moment; no gate check between apps sees it, but the final
+    # re-check does, so the failures are attributed to a new outage.
+    gate_results = iter([True, True, True, False])  # before each app, then the final re-check
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200 if request.url.port == 9696 else 500)
+
+    runner, _ = make_runner(handler, health_gate=lambda: next(gate_results))
+    outcome = runner.run()
+    assert outcome.results == {"Prowlarr": True, "Sonarr": False, "Radarr": False}
+    assert outcome.gluetun_unhealthy is True
 
 
 def test_unhealthy_gluetun_during_backoff_abandons_retries() -> None:

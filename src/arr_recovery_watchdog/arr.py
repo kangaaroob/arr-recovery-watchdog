@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Collection
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Mapping
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -19,6 +19,21 @@ Waiter = Callable[[float], bool]
 # re-checks it between steps and aborts early on failure, so the main loop can
 # return to outage handling instead of hammering APIs during a fresh outage.
 HealthGate = Callable[[], bool]
+
+
+@dataclass(frozen=True)
+class RecoveryOutcome:
+    """The outcome of one recovery sequence run.
+
+    `gluetun_unhealthy` means the sequence observed Gluetun unhealthy and
+    aborted: the caller must report a new outage to the state machine rather
+    than record the failures as ordinary partial Arr failures. `interrupted`
+    means shutdown cut the sequence short.
+    """
+
+    results: Mapping[str, bool] = field(default_factory=dict)
+    gluetun_unhealthy: bool = False
+    interrupted: bool = False
 
 
 @dataclass(frozen=True)
@@ -107,7 +122,8 @@ class RecoveryRunner:
 
     A failure in any one application never prevents attempts against the
     others, but if Gluetun itself turns unhealthy mid-sequence the remaining
-    applications are abandoned and reported as failed so they stay pending.
+    applications are abandoned and the outcome flags a new Gluetun outage so
+    the state machine can require a fresh stabilization window.
     """
 
     def __init__(
@@ -127,13 +143,17 @@ class RecoveryRunner:
         self._dry_run = dry_run
         self._health_gate = health_gate
 
-    def run(self, only: Collection[str] | None = None) -> dict[str, bool]:
+    def run(self, only: Collection[str] | None = None) -> RecoveryOutcome:
         """Run the sequence for the selected applications; None selects all.
 
         `only` restricts the run to the named applications, used when retrying
         a partially failed recovery so already-successful apps are not
         re-tested. The settle wait only happens when Prowlarr itself was
         tested and followers remain.
+
+        The outcome flags whether Gluetun was observed unhealthy during the
+        sequence, so the caller can record a new outage instead of treating
+        the aborted applications as ordinary partial failures.
         """
         suffix = " (dry run)" if self._dry_run else ""
 
@@ -145,7 +165,7 @@ class RecoveryRunner:
         planned: list[ArrClient] = ([prowlarr] if prowlarr is not None else []) + followers
         if not planned:
             logger.warning("Recovery requested but no configured application was selected")
-            return {}
+            return RecoveryOutcome()
         logger.info(
             "Starting Arr recovery sequence%s: %s",
             suffix,
@@ -170,7 +190,7 @@ class RecoveryRunner:
                     logger.warning("Shutdown requested during settle wait; skipping %s", names)
                     for client in followers:
                         results[client.name] = False
-                    return results
+                    return RecoveryOutcome(results=results, interrupted=True)
             for client in followers:
                 if not self._gluetun_healthy():
                     return self._abort(results, planned)
@@ -178,12 +198,21 @@ class RecoveryRunner:
 
         summary = " ".join(f"{name}={'ok' if ok else 'FAILED'}" for name, ok in results.items())
         logger.info("Arr recovery sequence complete%s: %s", suffix, summary)
-        return results
+        # A failure on the last application (or during its retry backoff) can
+        # be the first sign of a new Gluetun outage that no later gate check
+        # would see. Re-check once so those failures are attributed correctly.
+        if not all(results.values()) and not self._gluetun_healthy():
+            logger.warning(
+                "Gluetun is unhealthy after the recovery sequence; "
+                "treating the failed applications as part of a new outage"
+            )
+            return RecoveryOutcome(results=results, gluetun_unhealthy=True)
+        return RecoveryOutcome(results=results)
 
     def _gluetun_healthy(self) -> bool:
         return self._health_gate is None or self._health_gate()
 
-    def _abort(self, results: dict[str, bool], planned: list[ArrClient]) -> dict[str, bool]:
+    def _abort(self, results: dict[str, bool], planned: list[ArrClient]) -> RecoveryOutcome:
         remaining = [client.name for client in planned if client.name not in results]
         logger.warning(
             "Gluetun is unhealthy; aborting the recovery sequence before testing %s",
@@ -191,7 +220,7 @@ class RecoveryRunner:
         )
         for name in remaining:
             results[name] = False
-        return results
+        return RecoveryOutcome(results=results, gluetun_unhealthy=True)
 
     @staticmethod
     def _safe_test_all(client: ArrClient) -> bool:
