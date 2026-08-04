@@ -60,6 +60,7 @@ def test_run_loop_exits_promptly_on_shutdown(tmp_path: Path) -> None:
         PersistedState(),
         stability_seconds=60.0,
         cooldown_seconds=1800.0,
+        app_names=("Prowlarr",),
         healthy_now=True,
         mono_now=clock.monotonic(),
         utc_now=clock.now_utc(),

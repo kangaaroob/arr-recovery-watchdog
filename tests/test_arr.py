@@ -28,6 +28,7 @@ def make_client(
     backoff: BackoffPolicy | None = None,
     waiter: Callable[[float], bool] | None = None,
     dry_run: bool = False,
+    health_gate: Callable[[], bool] | None = None,
 ) -> tuple[ArrClient, list[float]]:
     waits: list[float] = []
 
@@ -43,6 +44,7 @@ def make_client(
         backoff=backoff or BackoffPolicy(),
         waiter=waiter or default_waiter,
         dry_run=dry_run,
+        health_gate=health_gate,
     )
     return client, waits
 
@@ -54,6 +56,7 @@ def make_runner(
     settle_seconds: float = 10.0,
     dry_run: bool = False,
     waiter: Callable[[float], bool] | None = None,
+    health_gate: Callable[[], bool] | None = None,
 ) -> tuple[RecoveryRunner, list[float]]:
     http = httpx.Client(transport=httpx.MockTransport(handler))
     waits: list[float] = []
@@ -73,6 +76,7 @@ def make_runner(
             backoff=BackoffPolicy(),
             waiter=active_waiter,
             dry_run=dry_run,
+            health_gate=health_gate,
         )
 
     prowlarr = build("Prowlarr", "http://127.0.0.1:9696", "/api/v1/indexer/testall")
@@ -84,6 +88,7 @@ def make_runner(
         settle_seconds=settle_seconds,
         waiter=active_waiter,
         dry_run=dry_run,
+        health_gate=health_gate,
     )
     return runner, waits
 
@@ -224,3 +229,66 @@ def test_shutdown_during_settle_wait_skips_followers() -> None:
     results = runner.run()
     assert requests == [PROWLARR_TESTALL]
     assert results == {"Prowlarr": True, "Sonarr": False, "Radarr": False}
+
+
+def test_only_restricts_the_run_and_skips_the_settle_wait() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(200)
+
+    runner, waits = make_runner(handler)
+    results = runner.run(only={"Sonarr"})
+    assert requests == [SONARR_TESTALL]  # Prowlarr already succeeded; not re-tested
+    assert results == {"Sonarr": True}
+    assert waits == []  # no settle wait when Prowlarr is not part of the run
+
+
+def test_only_prowlarr_runs_without_followers_or_settle() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(200)
+
+    runner, waits = make_runner(handler)
+    results = runner.run(only={"Prowlarr"})
+    assert requests == [PROWLARR_TESTALL]
+    assert results == {"Prowlarr": True}
+    assert waits == []
+
+
+def test_unhealthy_gluetun_before_start_aborts_the_whole_sequence() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no request should be sent while Gluetun is unhealthy: {request.url}")
+
+    runner, _ = make_runner(handler, health_gate=lambda: False)
+    results = runner.run()
+    assert results == {"Prowlarr": False, "Sonarr": False, "Radarr": False}
+
+
+def test_unhealthy_gluetun_after_settle_skips_followers() -> None:
+    requests: list[str] = []
+    gate_results = iter([True, False])  # healthy before Prowlarr, unhealthy after the settle
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(200)
+
+    runner, _ = make_runner(handler, health_gate=lambda: next(gate_results))
+    results = runner.run()
+    assert requests == [PROWLARR_TESTALL]
+    assert results == {"Prowlarr": True, "Sonarr": False, "Radarr": False}
+
+
+def test_unhealthy_gluetun_during_backoff_abandons_retries() -> None:
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(500)
+
+    client, _ = make_client(handler, retry_count=5, health_gate=lambda: False)
+    assert client.test_all() is False
+    assert len(calls) == 1  # no further attempts once Gluetun is unhealthy again

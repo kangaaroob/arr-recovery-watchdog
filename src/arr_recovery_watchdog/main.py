@@ -31,6 +31,11 @@ def _install_signal_handlers(stop: threading.Event) -> None:
     signal.signal(signal.SIGINT, handle)
 
 
+def _persist_if_dirty(machine: RecoveryStateMachine, store: StateStore, clock: Clock) -> None:
+    if machine.dirty and store.save(machine.snapshot(clock.now_utc())):
+        machine.dirty = False
+
+
 def run_loop(
     *,
     machine: RecoveryStateMachine,
@@ -42,21 +47,28 @@ def run_loop(
 ) -> None:
     """Poll Gluetun until shutdown, persisting transitions and running recoveries.
 
-    The wait is interruptible: SIGTERM/SIGINT set the stop event and the loop
-    exits promptly. Unexpected per-iteration errors are logged and survived.
+    A recovery only starts once the RECOVERING state is durable on disk; if the
+    state write fails, the recovery is deferred and requested again on the next
+    healthy poll. The wait is interruptible: SIGTERM/SIGINT set the stop event
+    and the loop exits promptly. Unexpected per-iteration errors are logged and
+    survived.
     """
     while not clock.wait(poll_interval):
         try:
             result = health.check()
             logger.debug("Health poll: healthy=%s (%s)", result.healthy, result.detail)
             action = machine.observe(result.healthy, clock.monotonic(), clock.now_utc())
-            if machine.dirty:
-                # Persist before acting: the recovery timestamp must be durable
-                # before any API call so failures cannot cause rapid retries.
-                store.save(machine.snapshot(clock.now_utc()))
-                machine.dirty = False
+            _persist_if_dirty(machine, store, clock)
             if action is Action.RUN_RECOVERY:
-                runner.run()
+                if machine.dirty:
+                    logger.error(
+                        "Recovery is due but the state file cannot be written; deferring the "
+                        "recovery until state can be persisted"
+                    )
+                    continue
+                results = runner.run(only=set(machine.pending_apps))
+                machine.complete_recovery(results, clock.now_utc())
+                _persist_if_dirty(machine, store, clock)
         except Exception:
             logger.exception("Unexpected error in poll loop; continuing")
 
@@ -94,16 +106,29 @@ def main() -> int:
     clock = RealClock(stop)
 
     store = StateStore(config.state_file)
+    if not store.verify_writable():
+        logger.error(
+            "Cannot write to the state directory for %s; running without durable state would "
+            "break recovery guarantees, so refusing to start. Check the /data volume mount "
+            "and permissions.",
+            config.state_file,
+        )
+        return 3
     persisted = store.load()
 
-    health_http = httpx.Client(timeout=httpx.Timeout(config.http_connect_timeout_seconds))
+    # trust_env=False: inherited proxy environment variables must never be able
+    # to redirect local health polls or API calls carrying Arr keys.
+    health_http = httpx.Client(
+        timeout=httpx.Timeout(config.http_connect_timeout_seconds), trust_env=False
+    )
     arr_http = httpx.Client(
         timeout=httpx.Timeout(
             connect=config.http_connect_timeout_seconds,
             read=config.http_response_timeout_seconds,
             write=config.http_response_timeout_seconds,
             pool=config.http_connect_timeout_seconds,
-        )
+        ),
+        trust_env=False,
     )
     try:
         health = GluetunHealthClient(config.gluetun_health_url, health_http)
@@ -113,17 +138,23 @@ def main() -> int:
             "healthy" if initial.healthy else "unhealthy",
             initial.detail,
         )
+
+        def gluetun_healthy() -> bool:
+            return health.check().healthy
+
+        apps = [
+            app for app in (config.prowlarr, config.sonarr, config.radarr) if app is not None
+        ]
         machine = RecoveryStateMachine.from_persisted(
             persisted,
             stability_seconds=config.healthy_stability_seconds,
             cooldown_seconds=config.action_cooldown_seconds,
+            app_names=[app.name for app in apps],
             healthy_now=initial.healthy,
             mono_now=clock.monotonic(),
             utc_now=clock.now_utc(),
         )
-        if machine.dirty:
-            store.save(machine.snapshot(clock.now_utc()))
-            machine.dirty = False
+        _persist_if_dirty(machine, store, clock)
 
         backoff = BackoffPolicy()
 
@@ -135,6 +166,7 @@ def main() -> int:
                 backoff=backoff,
                 waiter=clock.wait,
                 dry_run=config.dry_run,
+                health_gate=gluetun_healthy,
             )
 
         followers = [make_client(app) for app in (config.sonarr, config.radarr) if app is not None]
@@ -144,6 +176,7 @@ def main() -> int:
             settle_seconds=config.prowlarr_settle_seconds,
             waiter=clock.wait,
             dry_run=config.dry_run,
+            health_gate=gluetun_healthy,
         )
 
         run_loop(

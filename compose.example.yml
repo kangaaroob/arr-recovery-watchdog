@@ -13,7 +13,8 @@
 
 services:
   gluetun:
-    image: qmcgaw/gluetun:v3.40
+    # Placeholder — keep whatever image/tag your existing stack already pins.
+    image: qmcgaw/gluetun:v3
     # ... your existing Gluetun (AirVPN + WireGuard) configuration ...
     # The watchdog reaches the health endpoint on 127.0.0.1:9999 from inside
     # Gluetun's namespace. Do NOT publish or remap port 9999.

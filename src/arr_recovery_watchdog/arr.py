@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 
 import httpx
@@ -14,6 +14,11 @@ logger = logging.getLogger("watchdog.arr")
 
 # A waiter sleeps for the given seconds and returns True if shutdown was requested.
 Waiter = Callable[[float], bool]
+
+# A health gate returns True while Gluetun is healthy. The recovery sequence
+# re-checks it between steps and aborts early on failure, so the main loop can
+# return to outage handling instead of hammering APIs during a fresh outage.
+HealthGate = Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,7 @@ class ArrClient:
         backoff: BackoffPolicy,
         waiter: Waiter,
         dry_run: bool,
+        health_gate: HealthGate | None = None,
     ) -> None:
         self.name = app.name
         self._url = app.testall_url
@@ -48,12 +54,14 @@ class ArrClient:
         self._backoff = backoff
         self._waiter = waiter
         self._dry_run = dry_run
+        self._health_gate = health_gate
 
     def test_all(self) -> bool:
         """POST the test-all endpoint. Any 2xx response is success.
 
         Retries up to `retry_count` additional times with bounded exponential
-        backoff. Returns False if all attempts fail or shutdown interrupts.
+        backoff. Returns False if all attempts fail, shutdown interrupts, or
+        Gluetun turns unhealthy again during a backoff wait.
         """
         if self._dry_run:
             logger.info("[DRY RUN] %s: would POST %s", self.name, self._url)
@@ -73,6 +81,12 @@ class ArrClient:
                 if self._waiter(delay):
                     logger.warning("%s: shutdown requested; abandoning retries", self.name)
                     return False
+                if self._health_gate is not None and not self._health_gate():
+                    logger.warning(
+                        "%s: Gluetun became unhealthy during backoff; abandoning retries",
+                        self.name,
+                    )
+                    return False
             try:
                 response = self._http.post(self._url, headers={"X-Api-Key": self._api_key})
             except httpx.HTTPError as exc:
@@ -91,7 +105,9 @@ class ArrClient:
 class RecoveryRunner:
     """Executes the recovery sequence: Prowlarr first, then the other apps.
 
-    A failure in any one application never prevents attempts against the others.
+    A failure in any one application never prevents attempts against the
+    others, but if Gluetun itself turns unhealthy mid-sequence the remaining
+    applications are abandoned and reported as failed so they stay pending.
     """
 
     def __init__(
@@ -102,22 +118,49 @@ class RecoveryRunner:
         settle_seconds: float,
         waiter: Waiter,
         dry_run: bool,
+        health_gate: HealthGate | None = None,
     ) -> None:
         self._prowlarr = prowlarr
         self._followers = followers
         self._settle_seconds = settle_seconds
         self._waiter = waiter
         self._dry_run = dry_run
+        self._health_gate = health_gate
 
-    def run(self) -> dict[str, bool]:
+    def run(self, only: Collection[str] | None = None) -> dict[str, bool]:
+        """Run the sequence for the selected applications; None selects all.
+
+        `only` restricts the run to the named applications, used when retrying
+        a partially failed recovery so already-successful apps are not
+        re-tested. The settle wait only happens when Prowlarr itself was
+        tested and followers remain.
+        """
         suffix = " (dry run)" if self._dry_run else ""
-        logger.info("Starting Arr recovery sequence%s", suffix)
-        results: dict[str, bool] = {}
-        results[self._prowlarr.name] = self._safe_test_all(self._prowlarr)
 
-        if self._followers:
-            names = ", ".join(client.name for client in self._followers)
-            if self._settle_seconds > 0:
+        def selected(client: ArrClient) -> bool:
+            return only is None or client.name in only
+
+        prowlarr = self._prowlarr if selected(self._prowlarr) else None
+        followers = [client for client in self._followers if selected(client)]
+        planned: list[ArrClient] = ([prowlarr] if prowlarr is not None else []) + followers
+        if not planned:
+            logger.warning("Recovery requested but no configured application was selected")
+            return {}
+        logger.info(
+            "Starting Arr recovery sequence%s: %s",
+            suffix,
+            ", ".join(client.name for client in planned),
+        )
+
+        results: dict[str, bool] = {}
+        if prowlarr is not None:
+            if not self._gluetun_healthy():
+                return self._abort(results, planned)
+            results[prowlarr.name] = self._safe_test_all(prowlarr)
+
+        if followers:
+            names = ", ".join(client.name for client in followers)
+            if prowlarr is not None and self._settle_seconds > 0:
                 logger.info(
                     "Waiting %.0fs for Prowlarr to settle before testing %s",
                     self._settle_seconds,
@@ -125,14 +168,29 @@ class RecoveryRunner:
                 )
                 if self._waiter(self._settle_seconds):
                     logger.warning("Shutdown requested during settle wait; skipping %s", names)
-                    for client in self._followers:
+                    for client in followers:
                         results[client.name] = False
                     return results
-            for client in self._followers:
+            for client in followers:
+                if not self._gluetun_healthy():
+                    return self._abort(results, planned)
                 results[client.name] = self._safe_test_all(client)
 
         summary = " ".join(f"{name}={'ok' if ok else 'FAILED'}" for name, ok in results.items())
         logger.info("Arr recovery sequence complete%s: %s", suffix, summary)
+        return results
+
+    def _gluetun_healthy(self) -> bool:
+        return self._health_gate is None or self._health_gate()
+
+    def _abort(self, results: dict[str, bool], planned: list[ArrClient]) -> dict[str, bool]:
+        remaining = [client.name for client in planned if client.name not in results]
+        logger.warning(
+            "Gluetun is unhealthy; aborting the recovery sequence before testing %s",
+            ", ".join(remaining),
+        )
+        for name in remaining:
+            results[name] = False
         return results
 
     @staticmethod
