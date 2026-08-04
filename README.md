@@ -1,2 +1,281 @@
 # arr-recovery-watchdog
- This service will monitor Gluetun’s internal health endpoint. When Gluetun experiences an outage and subsequently becomes stably healthy, the service must call the official Prowlarr, Sonarr, and Radarr “Test All Indexers” APIs to clear their lingering circuit-breaker cooldowns.
+
+A small watchdog service that monitors Gluetun's internal health endpoint. When Gluetun
+experiences an outage and subsequently becomes stably healthy again, the watchdog calls the
+official Prowlarr, Sonarr, and Radarr **Test All Indexers** APIs to clear their lingering
+circuit-breaker cooldowns.
+
+## The problem
+
+1. Gluetun/AirVPN temporarily stops passing traffic.
+2. Prowlarr's indexers fail.
+3. Prowlarr, Sonarr, and Radarr apply increasingly long circuit-breaker cooldowns to the
+   failing indexers.
+4. Gluetun eventually repairs the VPN.
+5. The Arr applications remain disabled for hours, because nothing sends them an explicit
+   "the network is back" signal.
+
+This watchdog bridges steps 4 and 5. It does **not** attempt to repair the VPN, restart
+containers, or touch any Arr database — it only calls the same "Test All Indexers" endpoints
+you could click in each app's UI, which re-tests the indexers and clears their backoff timers.
+
+## Why poll Gluetun's health endpoint instead of Docker health events?
+
+Testing against a real Gluetun deployment showed that Docker's reported container health can
+remain `healthy` throughout a VPN failure and recovery, while Gluetun's internal health
+endpoint (`http://127.0.0.1:9999/`, HTTP 200 when healthy, HTTP 500 when unhealthy)
+transitions accurately. Docker events are therefore not a reliable trigger, and the watchdog
+polls the endpoint directly instead. It never touches `/var/run/docker.sock`.
+
+The endpoint only listens on localhost inside Gluetun's network namespace, so the watchdog
+runs with `network_mode: "service:gluetun"` and reaches it at `127.0.0.1:9999`. Do not expose
+the health port on the host or the Docker network.
+
+## The recovery state machine
+
+```
+                 unhealthy poll
+  MONITORING ───────────────────────► OUTAGE
+      ▲                                  │ healthy poll
+      │                                  ▼
+      │                             STABILIZING ◄────┐
+      │                                  │           │ any unhealthy poll
+      │        continuously healthy for  │           │ resets to OUTAGE
+      │        HEALTHY_STABILITY_SECONDS │           │
+      │                                  ▼           │
+      │                       cooldown expired? ─────┘
+      │                        │yes         │no
+      │   run recovery         ▼            ▼
+      └───────────────── (recovery)    COOLDOWN_WAIT ──► runs the recovery when the
+                                                         cooldown expires, if Gluetun
+                                                         is still healthy
+```
+
+- **MONITORING** — Gluetun is healthy and no outage is pending. The steady state.
+- **OUTAGE** — at least one unhealthy poll was observed (HTTP 500, any non-200 status,
+  connection refusal, timeout, DNS failure, or a malformed response). A single bad poll is
+  enough to be remembered. No Arr APIs are called while unhealthy.
+- **STABILIZING** — Gluetun returned to HTTP 200 after an outage. The watchdog requires it to
+  stay healthy continuously for `HEALTHY_STABILITY_SECONDS` (default 60 s); any failed poll
+  during this window resets the timer.
+- **COOLDOWN_WAIT** — stability was reached, but a recovery ran within the last
+  `ACTION_COOLDOWN_SECONDS` (default 30 min). The recovery stays pending and executes the
+  moment the cooldown expires — provided Gluetun is still healthy. If it becomes unhealthy
+  again, the machine returns to OUTAGE.
+
+The recovery sequence: POST Prowlarr's `/api/v1/indexer/testall`, wait
+`PROWLARR_SETTLE_SECONDS` (default 10 s) so Prowlarr can refresh its indexer state, then POST
+Sonarr's and Radarr's `/api/v3/indexer/testall`. Any 2xx response counts as success. Each
+application is attempted independently — one failing never blocks the others — and failed
+calls are retried `API_RETRY_COUNT` times with bounded exponential backoff (2 s, 4 s, 8 s, …
+capped at 30 s).
+
+The recovery timestamp is recorded and persisted **before** the API calls are made, so
+failures can never cause rapid repeated attempts.
+
+### Timekeeping and restarts
+
+- Stabilization is measured with **monotonic time**, immune to wall-clock jumps.
+- The recovery cooldown is stored as a **UTC wall-clock timestamp** so it survives restarts.
+- State is persisted to `/data/state.json` atomically (temp file + fsync + rename), and only
+  on meaningful transitions — never on every healthy poll.
+- A missing state file is normal (first run). A corrupt state file is logged clearly,
+  quarantined to `state.json.corrupt`, and replaced with fresh conservative state; the
+  service does not crash.
+- Restarting the watchdog while Gluetun is healthy and no outage was recorded performs **no**
+  retest. If an unresolved outage was recorded before the restart, the watchdog conservatively
+  restarts the stabilization window (it cannot prove health was continuous while it was down)
+  and then recovers normally.
+
+## Configuration
+
+Everything is configured through environment variables. All have sensible defaults.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `GLUETUN_HEALTH_URL` | `http://127.0.0.1:9999/` | Gluetun's internal health endpoint. |
+| `PROWLARR_URL` | `http://127.0.0.1:9696` | Prowlarr base URL (same namespace as Gluetun). |
+| `SONARR_URL` | `http://sonarr:8989` | Sonarr base URL. Set to `""` to disable Sonarr. |
+| `RADARR_URL` | `http://radarr:7878` | Radarr base URL. Set to `""` to disable Radarr. |
+| `POLL_INTERVAL_SECONDS` | `5` | How often the health endpoint is polled. |
+| `HEALTHY_STABILITY_SECONDS` | `60` | Continuous health required after an outage before recovery. |
+| `PROWLARR_SETTLE_SECONDS` | `10` | Wait between Prowlarr's test-all and Sonarr/Radarr's. |
+| `ACTION_COOLDOWN_SECONDS` | `1800` | Minimum time between recovery sequences. |
+| `HTTP_CONNECT_TIMEOUT_SECONDS` | `5` | HTTP connect timeout (also the health-poll response timeout). |
+| `HTTP_RESPONSE_TIMEOUT_SECONDS` | `60` | Response timeout for Arr API calls (test-all can be slow). |
+| `API_RETRY_COUNT` | `3` | Additional retries per Arr API call, with bounded backoff. |
+| `STATE_FILE` | `/data/state.json` | Persistent state location. |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. |
+| `DRY_RUN` | `false` | Monitor and log, but never send POST requests. |
+| `PROWLARR_API_KEY_FILE` | – | Path to a file containing the Prowlarr API key (recommended). |
+| `SONARR_API_KEY_FILE` | – | Path to a file containing the Sonarr API key. |
+| `RADARR_API_KEY_FILE` | – | Path to a file containing the Radarr API key. |
+| `PROWLARR_API_KEY` / `SONARR_API_KEY` / `RADARR_API_KEY` | – | Direct API keys, for development only. The `_FILE` variant always takes precedence. |
+
+Prowlarr is required: a missing Prowlarr API key is a clear configuration error (exit code 2).
+Sonarr and Radarr are optional: if an app has no API key it is skipped with a warning, and
+setting its URL to an empty string disables it silently.
+
+Secrets never appear in logs. A redaction filter additionally scrubs any configured API key
+from every log line as defense in depth, and URLs are logged with credentials stripped.
+
+## Obtaining the Arr API keys
+
+In each application's web UI: **Settings → General → Security → API Key**. Prowlarr, Sonarr,
+and Radarr each have their own key.
+
+## Creating secret files
+
+From your Compose project directory:
+
+```sh
+mkdir -p secrets
+printf '%s' 'your-prowlarr-api-key' > secrets/prowlarr_api_key
+printf '%s' 'your-sonarr-api-key'   > secrets/sonarr_api_key
+printf '%s' 'your-radarr-api-key'   > secrets/radarr_api_key
+chmod 700 secrets
+chmod 600 secrets/*
+```
+
+A trailing newline in the file is fine — the watchdog strips surrounding whitespace. Keep the
+`secrets/` directory out of version control (this repository's `.gitignore` already does).
+
+## Development: tests, linting, type checks
+
+Requires Python 3.12+.
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e '.[dev]'
+
+ruff check src tests    # lint
+mypy                    # type-check (strict)
+pytest                  # full test suite (fully mocked; touches no real services)
+```
+
+## Building the Docker image
+
+```sh
+docker build -t arr-recovery-watchdog .
+```
+
+The image runs as a non-root user, supports a read-only root filesystem, writes persistent
+data only under `/data` and temporary data only under `/tmp`, contains no secrets, and stops
+cleanly on SIGTERM.
+
+## Compose integration
+
+See [`compose.example.yml`](compose.example.yml) for a complete example. Key points:
+
+- `network_mode: "service:gluetun"` puts the watchdog inside Gluetun's network namespace, so
+  Gluetun's health endpoint and Prowlarr are reached via `127.0.0.1`. A service using
+  `network_mode: "service:..."` **cannot** declare its own `networks:` or `ports:` sections.
+- Sonarr and Radarr are reached by their Compose service names. That resolution and routing
+  happens through *Gluetun's* namespace, so it works when Sonarr/Radarr share a Compose
+  network with Gluetun. If they live on a different subnet, add it to Gluetun's
+  `FIREWALL_OUTBOUND_SUBNETS`.
+- **Namespace lifecycle caveat:** if Gluetun is recreated, the watchdog's network namespace
+  goes away with it and the watchdog must be restarted. `depends_on: { gluetun: { restart:
+  true } }` covers Compose-initiated recreations (e.g. `docker compose up -d` after a Gluetun
+  image update). After recreating Gluetun outside Compose, restart the watchdog manually.
+- `read_only: true`, a `tmpfs` on `/tmp`, a named volume on `/data`, and
+  `no-new-privileges:true` keep the container locked down. The watchdog exposes no ports and
+  serves nothing.
+
+## Deploying safely: start with DRY_RUN
+
+Set `DRY_RUN: "true"` (and optionally `LOG_LEVEL: DEBUG`) for the first deployment:
+
+```sh
+docker compose up -d --build arr-recovery-watchdog
+docker logs -f arr-recovery-watchdog
+```
+
+In dry-run mode the watchdog monitors Gluetun and walks the full state machine, but logs
+`[DRY RUN] ... would POST ...` instead of calling the Arr APIs. Once the transitions look
+right, remove `DRY_RUN` and re-deploy.
+
+## Verifying behavior with logs
+
+Expected lines at INFO level:
+
+```
+... watchdog.main Initial Gluetun health: healthy (HTTP 200)
+... watchdog.machine Startup: Gluetun healthy; baseline established, no action needed
+... watchdog.machine Outage detected: Gluetun health check failed
+... watchdog.machine Gluetun healthy again after outage; requiring 60s of continuous health before recovery
+... watchdog.machine Gluetun stable for 60s; initiating Arr recovery sequence
+... watchdog.arr Prowlarr: test-all accepted (HTTP 200)
+... watchdog.arr Waiting 10s for Prowlarr to settle before testing Sonarr, Radarr
+... watchdog.arr Sonarr: test-all accepted (HTTP 200)
+... watchdog.arr Radarr: test-all accepted (HTTP 200)
+... watchdog.arr Arr recovery sequence complete: Prowlarr=ok Sonarr=ok Radarr=ok
+```
+
+Per-poll details are at DEBUG level. All timestamps are UTC.
+
+## Manually forcing a Gluetun health failure (intentional, disruptive)
+
+To test the full loop, you can interrupt the VPN tunnel from inside the Gluetun container:
+
+```sh
+docker exec gluetun ip link set tun0 down
+```
+
+**Warning:** this genuinely interrupts VPN traffic for every container in Gluetun's
+namespace (Prowlarr, qBittorrent, …) until Gluetun's own health loop restores the tunnel.
+Only do this intentionally, in a maintenance window. It is deliberately *not* part of this
+project's automated test suite — the automated tests are fully mocked and never contact the
+homelab.
+
+Watch the watchdog logs: you should see the outage recorded, stabilization begin once Gluetun
+recovers, and — after 60 s of stable health — a recovery sequence (or a `[DRY RUN]` line).
+
+## Implications of sharing Gluetun's network namespace
+
+- The watchdog has no network identity of its own: no ports, no `networks:` section, and its
+  outbound traffic is subject to Gluetun's firewall and routing (which is what lets it reach
+  `127.0.0.1:9999` and Prowlarr directly).
+- If Gluetun is down entirely, the watchdog's polls fail — which is correctly interpreted as
+  "unhealthy" and handled by the state machine. The watchdog keeps running.
+- The watchdog's lifetime is coupled to Gluetun's namespace (see the lifecycle caveat above).
+
+## Troubleshooting
+
+| Symptom | Likely cause and fix |
+| --- | --- |
+| `test-all returned HTTP 401` | Wrong API key for that app, or the secret file contains the wrong value. Verify against Settings → General → Security in the app's UI. |
+| `test-all returned HTTP 500` (or 400) | The app reached its indexers but some tests failed — often the indexers themselves are still recovering, or genuinely broken. Check the app's System → Status page and indexer list. The watchdog retries and will try again after the next outage/cooldown. |
+| Health poll: connection refused | Gluetun's health server isn't reachable: the watchdog is treated as being in an outage. If it never recovers, confirm `network_mode: "service:gluetun"` is set and Gluetun's health server is on `127.0.0.1:9999` (Gluetun default `HEALTH_SERVER_ADDRESS`). |
+| Prowlarr: connection refused | Prowlarr is not in Gluetun's namespace, or a non-default port. `PROWLARR_URL` must be `http://127.0.0.1:9696` when Prowlarr shares Gluetun's namespace. |
+| Sonarr/Radarr unreachable (DNS failure or timeout) | The service name isn't resolvable/routable from Gluetun's namespace. Ensure Sonarr/Radarr share a Compose network with Gluetun; if they're on another subnet, add it to Gluetun's `FIREWALL_OUTBOUND_SUBNETS`. |
+| Watchdog exits immediately with code 2 | Configuration error — the log's `Configuration error: ...` line says exactly what to fix (most commonly a missing Prowlarr API key or an unreadable secret file). |
+| `State file ... is corrupt` | The previous state was quarantined to `state.json.corrupt` and the watchdog restarted fresh — safe, but worth investigating the volume if it recurs. |
+
+## Project layout
+
+```
+Dockerfile                     Hardened container build (non-root, read-only friendly)
+compose.example.yml            Example Compose integration with secrets
+pyproject.toml                 Packaging, ruff, mypy, pytest configuration
+src/arr_recovery_watchdog/
+  config.py                    Environment parsing, validation, secret files
+  health.py                    Gluetun health client
+  state.py                     Persistent state + atomic StateStore
+  machine.py                   The recovery state machine (pure logic, no I/O)
+  arr.py                       Arr API clients + recovery sequence runner
+  clock.py                     Injectable clock with interruptible waits
+  logs.py                      Logging setup + secret redaction
+  main.py                      Wiring, signal handling, poll loop
+tests/                         Fully mocked test suite (no live services)
+```
+
+## Design notes and boundaries
+
+- Version 1 deliberately has no Prometheus metrics, notifications, or UI.
+- The watchdog never restarts containers, never touches Docker, never modifies Gluetun or any
+  Arr database, and never selects VPN servers.
+- Retry backoff constants (base 2 s, cap 30 s) are fixed in code; the retry count is
+  configurable via `API_RETRY_COUNT`.
+- Exit codes: `0` after a clean shutdown (SIGTERM/SIGINT), `2` for configuration errors.

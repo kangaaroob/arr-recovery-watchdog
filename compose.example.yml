@@ -1,0 +1,67 @@
+# Example integration of arr-recovery-watchdog into an existing
+# Gluetun + Prowlarr + Sonarr + Radarr Compose stack.
+#
+# Merge the `arr-recovery-watchdog` service plus the `secrets` and `volumes`
+# entries into your stack. The `gluetun` service shown here is an abbreviated
+# placeholder for your existing definition.
+#
+# Namespace lifecycle caveat: the watchdog joins Gluetun's network namespace.
+# If Gluetun is recreated, the watchdog must be restarted so it joins the new
+# namespace. `depends_on: { gluetun: { restart: true } }` handles this for
+# Compose-initiated recreations; after a manual recreation outside Compose,
+# restart the watchdog yourself.
+
+services:
+  gluetun:
+    image: qmcgaw/gluetun:v3.40
+    # ... your existing Gluetun (AirVPN + WireGuard) configuration ...
+    # The watchdog reaches the health endpoint on 127.0.0.1:9999 from inside
+    # Gluetun's namespace. Do NOT publish or remap port 9999.
+
+  arr-recovery-watchdog:
+    build: ./arr-recovery-watchdog
+    container_name: arr-recovery-watchdog
+    # Shares Gluetun's network namespace. A service using network_mode
+    # "service:..." must not declare its own `networks:` or `ports:` section.
+    network_mode: "service:gluetun"
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_started
+        restart: true
+    environment:
+      GLUETUN_HEALTH_URL: http://127.0.0.1:9999/
+      PROWLARR_URL: http://127.0.0.1:9696
+      SONARR_URL: http://sonarr:8989
+      RADARR_URL: http://radarr:7878
+      POLL_INTERVAL_SECONDS: "5"
+      HEALTHY_STABILITY_SECONDS: "60"
+      PROWLARR_SETTLE_SECONDS: "10"
+      ACTION_COOLDOWN_SECONDS: "1800"
+      PROWLARR_API_KEY_FILE: /run/secrets/prowlarr_api_key
+      SONARR_API_KEY_FILE: /run/secrets/sonarr_api_key
+      RADARR_API_KEY_FILE: /run/secrets/radarr_api_key
+      # DRY_RUN: "true"    # strongly recommended for the first deployment
+      # LOG_LEVEL: DEBUG   # per-poll detail while validating
+    secrets:
+      - prowlarr_api_key
+      - sonarr_api_key
+      - radarr_api_key
+    volumes:
+      - arr-watchdog-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+secrets:
+  prowlarr_api_key:
+    file: ./secrets/prowlarr_api_key
+  sonarr_api_key:
+    file: ./secrets/sonarr_api_key
+  radarr_api_key:
+    file: ./secrets/radarr_api_key
+
+volumes:
+  arr-watchdog-data:
