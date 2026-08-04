@@ -246,7 +246,7 @@ a GHCR package public is **irreversible** — it cannot be made private again.
 Once public, no authentication is needed:
 
 ```sh
-docker pull ghcr.io/kangaaroob/arr-recovery-watchdog:1.0.0
+docker pull ghcr.io/kangaaroob/arr-recovery-watchdog:1.0.1
 ```
 
 While the package is still private, authenticate with a classic PAT that has **only** the
@@ -277,7 +277,7 @@ See [`compose.example.yml`](compose.example.yml) for a complete example. Key poi
 - The service consumes the published image pinned to an explicit release version:
 
   ```yaml
-  image: ghcr.io/kangaaroob/arr-recovery-watchdog:1.0.0
+  image: ghcr.io/kangaaroob/arr-recovery-watchdog:1.0.1
   ```
 
   To upgrade, edit the version to the new release and run:

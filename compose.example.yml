@@ -24,10 +24,10 @@ services:
     # version and change it deliberately when upgrading:
     #   docker compose pull arr-recovery-watchdog
     #   docker compose up -d arr-recovery-watchdog
-    # Available tags: 1.0.0 (exact), 1.0 / 1 (rolling), latest, sha-<commit>.
+    # Available tags: 1.0.1 (exact), 1.0 / 1 (rolling), latest, sha-<commit>.
     # To build from a local checkout instead, replace `image:` with
     # `build: ./arr-recovery-watchdog`.
-    image: ghcr.io/kangaaroob/arr-recovery-watchdog:1.0.0
+    image: ghcr.io/kangaaroob/arr-recovery-watchdog:1.0.1
     container_name: arr-recovery-watchdog
     # Shares Gluetun's network namespace. A service using network_mode
     # "service:..." must not declare its own `networks:` or `ports:` section.
