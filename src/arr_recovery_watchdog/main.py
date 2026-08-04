@@ -66,8 +66,16 @@ def run_loop(
                         "recovery until state can be persisted"
                     )
                     continue
-                results = runner.run(only=set(machine.pending_apps))
-                machine.complete_recovery(results, clock.now_utc())
+                outcome = runner.run(only=set(machine.pending_apps))
+                if outcome.gluetun_unhealthy:
+                    # The sequence aborted because Gluetun went down again.
+                    # Feed the observation into the machine as a fresh outage
+                    # — requiring a new stabilization window — instead of
+                    # recording an ordinary partial Arr failure, which would
+                    # merely cooldown-wait even though the VPN just broke.
+                    machine.observe(False, clock.monotonic(), clock.now_utc())
+                else:
+                    machine.complete_recovery(outcome.results, clock.now_utc())
                 _persist_if_dirty(machine, store, clock)
         except Exception:
             logger.exception("Unexpected error in poll loop; continuing")

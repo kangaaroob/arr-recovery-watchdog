@@ -27,3 +27,11 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    ignore:
+      # CI tests the application on Python 3.12; moving the container runtime
+      # to a new major/minor Python is a deliberate change, not an automated
+      # one. Patch releases and digest refreshes still flow through.
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"

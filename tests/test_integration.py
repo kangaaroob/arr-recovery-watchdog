@@ -30,6 +30,7 @@ class Harness:
         health_script: list[int],
         arr_handler,
         store: StateStore | None = None,
+        use_health_gate: bool = False,
     ) -> None:
         self.clock = clock
         self.posts: list[str] = []
@@ -55,6 +56,9 @@ class Harness:
             utc_now=clock.now_utc(),
         )
         arr_http = httpx.Client(transport=httpx.MockTransport(arr_handler))
+        # Same wiring as main(): the gate polls the real health client, so each
+        # gate check consumes one entry of the health script.
+        gate = (lambda: self.health.check().healthy) if use_health_gate else None
 
         def build(name: str, base_url: str, path: str) -> ArrClient:
             return ArrClient(
@@ -64,6 +68,7 @@ class Harness:
                 backoff=BackoffPolicy(),
                 waiter=clock.wait,
                 dry_run=False,
+                health_gate=gate,
             )
 
         self.runner = RecoveryRunner(
@@ -75,6 +80,7 @@ class Harness:
             settle_seconds=10.0,
             waiter=clock.wait,
             dry_run=False,
+            health_gate=gate,
         )
 
     def run(self) -> None:
@@ -131,6 +137,38 @@ def test_partially_failed_recovery_persists_the_pending_app(
     assert saved.phase == "cooldown_wait"
     assert saved.outage_observed is True
     assert saved.pending_apps == ("Sonarr",)
+
+
+def test_gluetun_outage_during_recovery_returns_to_outage_not_cooldown(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    posts: list[str] = []
+
+    def arr_handler(request: httpx.Request) -> httpx.Response:
+        posts.append(str(request.url))
+        return httpx.Response(200)
+
+    # Script: outage (500), four healthy polls to pass the 15 s stabilization
+    # window and trigger the recovery, then — inside the recovery sequence —
+    # the gate sees 200 before Prowlarr but 500 before Sonarr (Gluetun went
+    # down mid-recovery). The final 200 is the next ordinary poll, with
+    # Gluetun healthy again before the poll interval elapsed.
+    script = [500, 200, 200, 200, 200, 200, 500, 200]
+    harness = Harness(tmp_path, clock, script, arr_handler, use_health_gate=True)
+    harness.run()
+
+    # Only Prowlarr was tested; the rest of the sequence was aborted.
+    assert posts == [PROWLARR_TESTALL]
+
+    # The mid-recovery gate failure must be recorded as a fresh outage: the
+    # healthy poll that follows starts a NEW stabilization window (with the
+    # full sequence required again) instead of leaving the machine parked in
+    # cooldown_wait as if this were an ordinary partial Arr failure.
+    assert harness.machine.phase is Phase.STABILIZING
+    saved = harness.store.load()
+    assert saved.phase == "stabilizing"
+    assert saved.outage_observed is True
+    assert saved.pending_apps == ()
 
 
 class FlakyStore(StateStore):

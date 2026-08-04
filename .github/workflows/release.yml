@@ -20,9 +20,16 @@ on:
 permissions:
   contents: read
 
-# Serialize runs per tag; never cancel a release mid-publish.
+# One global group: releases for DIFFERENT versions must also serialize, or a
+# slower older-version run could recompute its rolling tags before a newer
+# version's tag exists and then move latest/1/1.2 backwards after the newer
+# run finishes. Because the publish plan is computed after a queued run
+# starts, a queued older release sees the newer tags and declines the rolling
+# tags. Never cancel a release mid-publish. (GitHub keeps only the newest
+# queued run per group; if several releases are published near-simultaneously
+# a middle one can be superseded — recover with the workflow_dispatch re-run.)
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+  group: release-publish
   cancel-in-progress: false
 
 env:
