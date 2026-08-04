@@ -20,7 +20,14 @@ services:
     # Gluetun's namespace. Do NOT publish or remap port 9999.
 
   arr-recovery-watchdog:
-    build: ./arr-recovery-watchdog
+    # Published image from GitHub Container Registry. Pin an explicit release
+    # version and change it deliberately when upgrading:
+    #   docker compose pull arr-recovery-watchdog
+    #   docker compose up -d arr-recovery-watchdog
+    # Available tags: 1.0.0 (exact), 1.0 / 1 (rolling), latest, sha-<commit>.
+    # To build from a local checkout instead, replace `image:` with
+    # `build: ./arr-recovery-watchdog`.
+    image: ghcr.io/kangaaroob/arr-recovery-watchdog:1.0.0
     container_name: arr-recovery-watchdog
     # Shares Gluetun's network namespace. A service using network_mode
     # "service:..." must not declare its own `networks:` or `ports:` section.

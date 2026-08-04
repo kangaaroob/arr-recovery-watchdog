@@ -181,7 +181,85 @@ mypy                    # type-check (strict)
 pytest                  # full test suite (fully mocked; touches no real services)
 ```
 
-## Building the Docker image
+## Continuous integration
+
+Every pull request, push to `main`, and manual dispatch runs the CI workflow
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): Ruff, strict Mypy, the full Pytest
+suite, and a Docker image build that is **never published**. CI runs with a read-only
+`GITHUB_TOKEN`, has no access to runtime Arr API keys, the homelab, or any registry
+credential, and cannot publish packages. Superseded runs for the same branch or pull request
+are cancelled automatically.
+
+## Releases and the published image
+
+Container images are published to GitHub Container Registry:
+
+```text
+ghcr.io/kangaaroob/arr-recovery-watchdog
+```
+
+### Publishing a release
+
+1. Bump `[project].version` in `pyproject.toml` and merge to `main`. This is the version's
+   single source of truth — the running application reports it via package metadata, and the
+   release workflow refuses to publish a tag that doesn't match it.
+2. On GitHub: **Releases → Draft a new release**, create a tag in the form `vMAJOR.MINOR.PATCH`
+   (e.g. `v1.2.3`) targeting `main`, and publish. For a prerelease, use a semver prerelease
+   tag such as `v1.2.3-rc.1` **and** check the "Set as a pre-release" box.
+3. Publishing the release triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
+   which validates the tag, re-runs Ruff/Mypy/Pytest at the exact tagged commit, and only then
+   builds and pushes the image with Docker Buildx, provenance attestation, and an SBOM.
+   Nothing is published if any validation or test fails.
+
+The workflow authenticates with the automatic `GITHUB_TOKEN` — no Docker Hub account, no
+manually created PAT, and no custom publishing secret is required or accepted. Runtime
+Prowlarr/Sonarr/Radarr API keys remain homelab-only secrets and are never stored in GitHub
+Actions. A `workflow_dispatch` re-run is available for transient failures, but only for a tag
+that already belongs to a published GitHub Release.
+
+### Image tags
+
+A stable release `v1.2.3` publishes:
+
+| Tag | Meaning |
+| --- | --- |
+| `1.2.3` | Exact release — **recommended for deployments** |
+| `1.2` | Newest patch release within 1.2 |
+| `1` | Newest release within major version 1 |
+| `latest` | Newest stable release |
+| `sha-<commit>` | The exact source commit |
+
+A prerelease such as `v1.2.3-rc.1` publishes only `1.2.3-rc.1` and `sha-<commit>` — it never
+updates `latest`, `1`, or `1.2`. The rolling tags are recomputed against every existing
+release tag at publish time, so publishing (or re-running) an older stable release can never
+move `latest` away from a newer one.
+
+### Package visibility (first release only)
+
+GHCR packages are **private on first publication**. To make the image publicly pullable, the
+repository owner must, once: GitHub profile → **Packages** → `arr-recovery-watchdog` →
+**Package settings** → **Danger Zone** → **Change visibility** → **Public**. Note that making
+a GHCR package public is **irreversible** — it cannot be made private again.
+
+### Pulling the image
+
+Once public, no authentication is needed:
+
+```sh
+docker pull ghcr.io/kangaaroob/arr-recovery-watchdog:1.0.0
+```
+
+While the package is still private, authenticate with a classic PAT that has **only** the
+`read:packages` scope:
+
+```sh
+echo "$GHCR_READ_TOKEN" | docker login ghcr.io -u <github-username> --password-stdin
+```
+
+## Building the Docker image locally
+
+Deployments should normally use the published GHCR image, but a local build works exactly as
+before:
 
 ```sh
 docker build -t arr-recovery-watchdog .
@@ -189,12 +267,29 @@ docker build -t arr-recovery-watchdog .
 
 The image runs as a non-root user, supports a read-only root filesystem, writes persistent
 data only under `/data` and temporary data only under `/tmp`, contains no secrets, and stops
-cleanly on SIGTERM.
+cleanly on SIGTERM. The base image is pinned by digest for reproducible builds; Dependabot
+keeps the pin current.
 
 ## Compose integration
 
 See [`compose.example.yml`](compose.example.yml) for a complete example. Key points:
 
+- The service consumes the published image pinned to an explicit release version:
+
+  ```yaml
+  image: ghcr.io/kangaaroob/arr-recovery-watchdog:1.0.0
+  ```
+
+  To upgrade, edit the version to the new release and run:
+
+  ```sh
+  docker compose pull arr-recovery-watchdog
+  docker compose up -d arr-recovery-watchdog
+  ```
+
+  Pinning the exact version keeps upgrades deliberate; the rolling `1.0` / `1` / `latest`
+  tags exist if you prefer them. To build from a local checkout instead, replace `image:`
+  with `build: ./arr-recovery-watchdog`.
 - `network_mode: "service:gluetun"` puts the watchdog inside Gluetun's network namespace, so
   Gluetun's health endpoint and Prowlarr are reached via `127.0.0.1`. A service using
   `network_mode: "service:..."` **cannot** declare its own `networks:` or `ports:` sections.
@@ -215,7 +310,8 @@ See [`compose.example.yml`](compose.example.yml) for a complete example. Key poi
 Set `DRY_RUN: "true"` (and optionally `LOG_LEVEL: DEBUG`) for the first deployment:
 
 ```sh
-docker compose up -d --build arr-recovery-watchdog
+docker compose pull arr-recovery-watchdog
+docker compose up -d arr-recovery-watchdog
 docker logs -f arr-recovery-watchdog
 ```
 
@@ -295,6 +391,9 @@ recovers, and — after 60 s of stable health — a recovery sequence (or a `[DR
 ## Project layout
 
 ```
+.github/workflows/ci.yml       Lint + type-check + test + unpublished Docker build
+.github/workflows/release.yml  Tag validation, tests, GHCR publish with attestation
+.github/dependabot.yml         Weekly Actions/pip/Docker dependency updates
 Dockerfile                     Hardened container build (non-root, read-only friendly)
 compose.example.yml            Example Compose integration with secrets
 pyproject.toml                 Packaging, ruff, mypy, pytest configuration

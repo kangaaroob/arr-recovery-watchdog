@@ -1,31 +1,63 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
+  workflow_dispatch:
+
+# CI never publishes anything and never touches runtime secrets: read-only
+# token, no registry login, docker build with push disabled.
+permissions:
+  contents: read
+
+# Cancel superseded runs for the same branch / pull request.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   checks:
+    name: Lint, type-check, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project with dev dependencies
         run: pip install -e '.[dev]'
-      - name: Lint
+
+      - name: Ruff
         run: ruff check src tests
-      - name: Type-check
+
+      - name: Mypy (strict)
         run: mypy
-      - name: Test
+
+      - name: Pytest
         run: pytest
 
-  docker:
+  docker-build:
+    name: Docker build (no publish)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Build image
-        run: docker build -t arr-recovery-watchdog .
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build image (not pushed)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

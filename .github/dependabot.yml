@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # SHA-pinned actions in .github/workflows; updates bump the pin and the
+  # version comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Python dependencies from pyproject.toml (runtime + dev extras).
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+
+  # Digest-pinned python base image in the Dockerfile.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday

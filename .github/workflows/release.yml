@@ -1,0 +1,240 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  # Manual re-run for an EXISTING published GitHub Release only (e.g. after a
+  # transient failure). The validate job refuses tags without a published
+  # release, and rolling tags (latest / 1 / 1.2) are recomputed against every
+  # tag in the repository at run time, so re-running an older release can
+  # never move them backwards.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of an existing published GitHub Release, e.g. v1.2.3"
+        required: true
+        type: string
+
+# Read-only by default; only the publish job elevates, and only to what
+# pushing the image and its attestation requires.
+permissions:
+  contents: read
+
+# Serialize runs per tag; never cancel a release mid-publish.
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/kangaaroob/arr-recovery-watchdog
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      commit: ${{ steps.plan.outputs.commit }}
+      short_commit: ${{ steps.plan.outputs.short_commit }}
+      publish_latest: ${{ steps.plan.outputs.publish_latest }}
+      publish_major: ${{ steps.plan.outputs.publish_major }}
+      publish_minor: ${{ steps.plan.outputs.publish_minor }}
+    steps:
+      - name: Check out repository (full history and tags)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag and compute publish plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+            # Manual runs may only republish an already-published release.
+            if ! release_json=$(gh release view "$tag" --json isDraft,isPrerelease); then
+              echo "::error::No GitHub Release exists for tag '$tag'. Publish the release first."
+              exit 1
+            fi
+            if [ "$(jq -r .isDraft <<<"$release_json")" = "true" ]; then
+              echo "::error::The release for tag '$tag' is still a draft."
+              exit 1
+            fi
+            gh_prerelease=$(jq -r .isPrerelease <<<"$release_json")
+          else
+            tag="$RELEASE_TAG"
+            gh_prerelease="$RELEASE_PRERELEASE"
+          fi
+
+          stable_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          prerelease_id='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          semver_re="^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-${prerelease_id}(\.${prerelease_id})*)?$"
+
+          if ! grep -Eq "$semver_re" <<<"$tag"; then
+            echo "::error::Tag '$tag' is not valid semver. Use vMAJOR.MINOR.PATCH (e.g. v1.2.3), optionally with a prerelease suffix (e.g. v1.2.3-rc.1)."
+            exit 1
+          fi
+
+          if grep -Eq "$stable_re" <<<"$tag"; then is_stable=true; else is_stable=false; fi
+
+          # A stable tag on a release flagged "pre-release" in the GitHub UI is
+          # a mistake: it would publish rolling tags for something the
+          # maintainer marked as not production-ready.
+          if [ "$is_stable" = "true" ] && [ "$gh_prerelease" = "true" ]; then
+            echo "::error::Release '$tag' has a stable tag but is marked as a pre-release on GitHub. Use a -rc./-beta. tag for prereleases, or unmark the release."
+            exit 1
+          fi
+
+          if ! commit=$(git rev-list -n 1 "refs/tags/$tag" 2>/dev/null); then
+            echo "::error::Tag '$tag' does not exist in this repository."
+            exit 1
+          fi
+          short_commit=$(git rev-parse --short=7 "$commit")
+
+          version="${tag#v}"
+          major="${version%%.*}"
+          rest="${version#*.}"
+          minor="${rest%%.*}"
+
+          # The application reports the version from package metadata, whose
+          # single source is pyproject.toml — so the tag must match it.
+          pyver=$(git show "$commit:pyproject.toml" \
+            | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["project"]["version"])')
+          if [ "v$pyver" != "$tag" ]; then
+            echo "::error::pyproject.toml at $tag declares version '$pyver', but the release tag is '$tag'. Bump [project].version before tagging so the running application reports the release version."
+            exit 1
+          fi
+
+          # Rolling tags are recomputed against every stable tag currently in
+          # the repository, so publishing or re-running an older stable
+          # release can never move latest / 1 / 1.2 backwards.
+          publish_latest=false publish_major=false publish_minor=false
+          if [ "$is_stable" = "true" ]; then
+            stable_tags=$(git tag -l 'v*' | { grep -E "$stable_re" || true; })
+            highest_all=$(sort -V <<<"$stable_tags" | tail -n 1)
+            highest_major=$(grep -E "^v${major}\." <<<"$stable_tags" | sort -V | tail -n 1)
+            highest_minor=$(grep -E "^v${major}\.${minor}\." <<<"$stable_tags" | sort -V | tail -n 1)
+            if [ "$tag" = "$highest_all" ]; then publish_latest=true; fi
+            if [ "$tag" = "$highest_major" ]; then publish_major=true; fi
+            if [ "$tag" = "$highest_minor" ]; then publish_minor=true; fi
+          fi
+
+          echo "Publish plan: tag=$tag version=$version commit=$commit stable=$is_stable" \
+               "latest=$publish_latest major-tag=$publish_major minor-tag=$publish_minor"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "commit=$commit"
+            echo "short_commit=$short_commit"
+            echo "publish_latest=$publish_latest"
+            echo "publish_major=$publish_major"
+            echo "publish_minor=$publish_minor"
+          } >>"$GITHUB_OUTPUT"
+
+  test:
+    name: Lint, type-check, test
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project with dev dependencies
+        run: pip install -e '.[dev]'
+
+      - name: Ruff
+        run: ruff check src tests
+
+      - name: Mypy (strict)
+        run: mypy
+
+      - name: Pytest
+        run: pytest
+
+  publish:
+    name: Build and publish image
+    needs: [validate, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags and OCI labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          # latest is decided by the validate job, never implicitly.
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.validate.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.validate.outputs.tag }},enable=${{ needs.validate.outputs.publish_minor }}
+            type=semver,pattern={{major}},value=${{ needs.validate.outputs.tag }},enable=${{ needs.validate.outputs.publish_major }}
+            type=raw,value=latest,enable=${{ needs.validate.outputs.publish_latest }}
+            type=raw,value=sha-${{ needs.validate.outputs.short_commit }}
+          # Explicit values so revision/version describe the release commit
+          # even on workflow_dispatch (where the event context is the default
+          # branch, not the tag).
+          labels: |
+            org.opencontainers.image.title=arr-recovery-watchdog
+            org.opencontainers.image.description=Watchdog that clears Prowlarr/Sonarr/Radarr indexer circuit-breaker cooldowns after a Gluetun VPN outage recovers
+            org.opencontainers.image.source=https://github.com/kangaaroob/arr-recovery-watchdog
+            org.opencontainers.image.revision=${{ needs.validate.outputs.commit }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
